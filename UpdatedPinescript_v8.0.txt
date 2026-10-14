@@ -1,0 +1,193 @@
+//@version=6
+indicator("Institutional Trend Signals v8.0", overlay=true, max_labels_count=500)
+
+//====================================================
+// 1. USER INPUTS
+//====================================================
+fastMACD          = input.int(12, "MACD Fast")
+slowMACD          = input.int(26, "MACD Slow")
+signalMACD        = input.int(9,  "MACD Signal")
+rsiLength         = input.int(14, "RSI Length")
+rsiBuy            = input.int(55, "RSI Buy Level")
+rsiExitLong       = input.int(50, "RSI Exit Level")
+emaFast           = input.int(20, "EMA Fast")
+emaSlow           = input.int(50, "EMA Slow")
+useVWAP           = input.bool(true, "Use VWAP Filter")
+vwapExitBufferATR = input.float(0.2, "VWAP Exit Buffer")
+volLength         = input.int(20, "Volume SMA")
+volMultiplier     = input.float(1.50, "Volume Multiplier")
+adxLength         = input.int(14, "ADX Length")
+adxSmooth         = input.int(14, "ADX Smoothing")
+adxThreshold      = input.float(30.0, "ADX Entry Threshold")
+adxExitThreshold  = input.float(20.0, "ADX Exit Threshold")
+atrLength         = input.int(14, "ATR Length")
+atrMultiplier     = input.float(1.5, "ATR Trailing Stop Mult")
+useMinervini      = input.bool(true, "Enable Minervini V2")
+rsPeriod          = input.int(126, "RS Lookback (Days)")
+rsThreshold       = input.float(30.0, "RS Threshold (%)")
+useRegimeFilter   = input.bool(true, "Enable Nifty Regime Filter")
+
+//====================================================
+// 2. FORCED DAILY RESOLUTION CALCULATIONS
+//====================================================
+f_calc_daily_signals() =>
+    // --- Market Regime ---
+    niftyClose = request.security("NSE:NIFTY", "D", close, lookahead=barmerge.lookahead_off)
+    niftyEma200 = request.security("NSE:NIFTY", "D", ta.ema(close, 200), lookahead=barmerge.lookahead_off)
+    bool _strongMarket = not useRegimeFilter or (niftyClose > niftyEma200)
+
+    // --- Indicators ---
+    [_macd, _signal, _] = ta.macd(close, fastMACD, slowMACD, signalMACD)
+    _rsi = ta.rsi(close, rsiLength)
+    _ema20 = ta.ema(close, emaFast)
+    _ema50 = ta.ema(close, emaSlow)
+    _vwap = ta.sma(close * volume, 20) / ta.sma(volume, 20)
+    [_, _, _adx] = ta.dmi(adxLength, adxSmooth)
+    _atr = ta.atr(atrLength)
+    _volSma = ta.sma(volume, volLength)
+
+    // --- Minervini V2 ---
+    _sma50 = ta.sma(close, 50)
+    _sma150 = ta.sma(close, 150)
+    _sma200 = ta.sma(close, 200)
+    _sma200_prev = ta.sma(close, 200)[21]
+    _rs6m = (close - close[rsPeriod]) / close[rsPeriod] * 100
+    bool _minervini = (
+         (close > _sma50) and (close > _sma150) and (close > _sma200) and
+         (_sma50 > _sma150) and (_sma150 > _sma200) and
+         (_sma200 > _sma200_prev) and (_rs6m > rsThreshold)
+         )
+
+    // --- Entry & Exit Logic ---
+    bool _longEntry = (
+         (_ema20 > _ema50) and (_macd > _signal) and (_rsi > rsiBuy) and
+         (not useVWAP or close > _vwap) and (_adx > adxThreshold) and
+         (volume > (_volSma * volMultiplier)) and (not useMinervini or _minervini)
+         )
+
+    int _negCount = (
+         (_ema20 < _ema50 ? 1 : 0) + (_macd < 0 ? 1 : 0) + (_rsi < rsiExitLong ? 1 : 0) +
+         ((not useVWAP or close > _vwap - (_atr * vwapExitBufferATR)) ? 0 : 1) +
+         (_adx < adxExitThreshold ? 1 : 0)
+         )
+    bool _exitWarning = _negCount >= 4
+
+    // --- Visual Trade Simulation (State Machine) ---
+    var float _trailStop = na
+    var float _highestHigh = na
+    var bool _inTrade = false
+    var bool _buySignal = false
+    var bool _sellSignal = false
+
+    _buySignal := false
+    _sellSignal := false
+
+    if not _inTrade and _longEntry and _strongMarket
+        _inTrade := true
+        _highestHigh := high
+        _trailStop := close - (_atr * atrMultiplier)
+        _buySignal := true
+    else if _inTrade
+        _highestHigh := math.max(_highestHigh, high)
+        float _newTrail = _highestHigh - (_atr * atrMultiplier)
+        _trailStop := math.max(_trailStop, _newTrail)
+
+        bool _exitTrigger = false
+        if low <= _trailStop
+            _exitTrigger := true
+        else if _exitWarning
+            _exitTrigger := true
+
+        if _exitTrigger
+            _inTrade := false
+            _trailStop := na
+            _highestHigh := na
+            _sellSignal := true
+
+    // Return all necessary variables
+    [_buySignal, _sellSignal, _inTrade, _trailStop, _longEntry, _strongMarket, _minervini, _rs6m, _ema20, _ema50, _macd, _signal, _rsi, _vwap, _adx, _volSma]
+
+// Fetch Daily Signals and Indicator Values
+[buySig, sellSig, isInTrade, isTrailStop, isLongEntry, isStrongMarket, isMinervini, isRS, d_ema20, d_ema50, d_macd, d_signal, d_rsi, d_vwap, d_adx, d_volSma] = request.security(syminfo.tickerid, "D", f_calc_daily_signals(), lookahead=barmerge.lookahead_off)
+
+//====================================================
+// 3. PLOTTING (Signals Only)
+//====================================================
+bool newDay = ta.change(time("D")) != 0
+plotshape(buySig and newDay, title="Long Entry", style=shape.labelup, location=location.belowbar, color=color.green, text="BUY", textcolor=color.white, size=size.small)
+plotshape(sellSig and newDay, title="Long Exit", style=shape.labeldown, location=location.abovebar, color=color.red, text="SELL", textcolor=color.white, size=size.small)
+
+//====================================================
+// 4. DASHBOARD TABLE (Top Right)
+//====================================================
+var table dashTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 85), frame_color=color.gray, border_width=1)
+
+if barstate.islast
+    table.cell(dashTable, 0, 0, "SYSTEM STATUS (DAILY)", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 50))
+    table.cell(dashTable, 1, 0, isStrongMarket ? "STRONG" : "WEAK", text_color=isStrongMarket ? color.green : color.red, text_size=size.small, bgcolor=color.new(color.gray, 50))
+    
+    table.cell(dashTable, 0, 1, "Nifty vs 200 EMA", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 1, isStrongMarket ? "Above" : "Below", text_color=color.white, text_size=size.small)
+    
+    table.cell(dashTable, 0, 2, "Minervini V2", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 2, (not useMinervini or isMinervini) ? "PASS" : "FAIL", text_color=(not useMinervini or isMinervini) ? color.green : color.red, text_size=size.small)
+    
+    table.cell(dashTable, 0, 3, "RS 6-Month", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 3, str.tostring(isRS, "#.##") + "%", text_color=isRS > rsThreshold ? color.green : color.red, text_size=size.small)
+    
+    table.cell(dashTable, 0, 4, "Trade State", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 4, isInTrade ? "IN TRADE" : "FLAT", text_color=isInTrade ? color.green : color.orange, text_size=size.small)
+
+    table.cell(dashTable, 0, 5, "Trail Stop", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 5, isInTrade ? str.tostring(isTrailStop, "#.##") : "N/A", text_color=color.white, text_size=size.small)
+    
+    table.cell(dashTable, 0, 6, "ACTION", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 50))
+    table.cell(dashTable, 1, 6, buySig ? "BUY" : (sellSig ? "SELL" : "WAIT"), text_color=buySig ? color.green : (sellSig ? color.red : color.white), text_size=size.small, bgcolor=color.new(color.gray, 50))
+
+//====================================================
+// 5. RECENT ENTRY / EXIT SIGNAL HISTORY (Bottom Right)
+//    BUY = green, SELL = red; latest two of each.
+//====================================================
+var string buyDate1 = "N/A"
+var string buyDate2 = "N/A"
+var string buyPrice1 = "N/A"
+var string buyPrice2 = "N/A"
+
+var string sellDate1 = "N/A"
+var string sellDate2 = "N/A"
+var string sellPrice1 = "N/A"
+var string sellPrice2 = "N/A"
+
+bool historyBuy = buySig and newDay
+bool historySell = sellSig and newDay
+
+if historyBuy
+    buyDate2 := buyDate1
+    buyPrice2 := buyPrice1
+    buyDate1 := str.format_time(time, "dMMM yy")
+    buyPrice1 := str.tostring(close, format.mintick)
+
+if historySell
+    sellDate2 := sellDate1
+    sellPrice2 := sellPrice1
+    sellDate1 := str.format_time(time, "dMMM yy")
+    sellPrice1 := str.tostring(close, format.mintick)
+
+// Four-column layout: Buy | Price | Sell | Price
+var table signalHistory = table.new(position.bottom_right, 4, 3, bgcolor=color.new(color.black, 15), frame_color=color.gray, border_width=1)
+
+if barstate.islast
+    table.cell(signalHistory, 0, 0, "BUY", text_color=color.white, bgcolor=color.green, text_size=size.small)
+    table.cell(signalHistory, 1, 0, "Price", text_color=color.white, bgcolor=color.green, text_size=size.small)
+    table.cell(signalHistory, 2, 0, "SELL", text_color=color.white, bgcolor=color.red, text_size=size.small)
+    table.cell(signalHistory, 3, 0, "Price", text_color=color.white, bgcolor=color.red, text_size=size.small)
+
+    table.cell(signalHistory, 0, 1, buyDate1, text_color=color.lime, text_size=size.small)
+    table.cell(signalHistory, 1, 1, buyPrice1, text_color=color.lime, text_size=size.small)
+    table.cell(signalHistory, 2, 1, isInTrade ? "OPEN" : sellDate1, text_color=color.red, text_size=size.small)
+    table.cell(signalHistory, 3, 1, isInTrade ? "" : sellPrice1, text_color=color.red, text_size=size.small)
+
+    table.cell(signalHistory, 0, 2, buyDate2, text_color=color.lime, text_size=size.small)
+    table.cell(signalHistory, 1, 2, buyPrice2, text_color=color.lime, text_size=size.small)
+    table.cell(signalHistory, 2, 2, sellDate2, text_color=color.red, text_size=size.small)
+    table.cell(signalHistory, 3, 2, sellPrice2, text_color=color.red, text_size=size.small)
